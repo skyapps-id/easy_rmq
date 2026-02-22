@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
     }
 
     println!("\n✓ All messages published!");
+    
+    // Wait for messages to be sent
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    println!("✓ Shutdown complete");
 
     Ok(())
 }
