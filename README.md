@@ -112,51 +112,101 @@ publisher.publish_json("order.created", &order).await?;
 ✅ **Auto-create exchange** jika belum ada (durable)  
 ✅ **Tidak perlu manual setup**
 
-### Custom Default Exchange
+### Multiple Exchanges
 
 ```rust
-// Set default exchange di client level
-let client = AmqpClient::new("...", 10)?
-    .with_exchange("my_exchange");
+use lapin::ExchangeKind;
 
-let publisher = client.publisher();
-// Semua publish otomatis ke "my_exchange"
+let client = AmqpClient::new("...", 10)?;
+
+// Publisher 1 - Direct exchange
+let pub1 = client.publisher().with_exchange("orders", ExchangeKind::Direct);
+pub1.publish_text("order.created", "Order data").await?;
+
+// Publisher 2 - Topic exchange
+let pub2 = client.publisher().with_exchange("logs", ExchangeKind::Topic);
+pub2.publish_text("order.created", "Log data").await?;
+
+// Publisher 3 - Fanout exchange
+let pub3 = client.publisher().with_exchange("broadcast", ExchangeKind::Fanout);
+pub3.publish_text("any", "Broadcast data").await?;
+
+// Shortcut methods
+let pub4 = client.publisher().with_topic("logs");
+let pub5 = client.publisher().with_direct("orders");
+let pub6 = client.publisher().with_fanout("events");
 ```
+
+✅ **Explicit** - tipe exchange jelas dari parameter  
+✅ **Fleksibel** - Direct, Topic, Fanout, Headers  
+✅ **Auto-create** exchange dengan tipe yang sesuai
 
 ### Subscriber
 
-Subscriber **auto-create queue** + **bind**:
+Subscriber **auto-create queue** dengan nama terformat:
 
 ```rust
 use easy_amqp::{AmqpClient, AmqpSubscriber};
+use lapin::ExchangeKind;
 
 let client = AmqpClient::new("amqp://guest:guest@localhost:5672".to_string(), 10)?;
 
-let subscriber = client.subscriber();
+// Direct exchange - format: routing_key + "worker"
+let sub = client.subscriber().with_exchange("sales", ExchangeKind::Direct);
+sub.subscribe("job", "order.process", handler).await?;
+// Queue: order.processworker
 
-// Simple: queue, routing_key, handler
-subscriber.subscribe(
-    "order_queue",      // Auto-created (durable)
-    "order.created",    // Routing key
-    |data: Vec<u8>| {
-        let message = String::from_utf8_lossy(&data);
-        println!("Received: {}", message);
-        Ok(())
-    }
-).await?;
+// Topic exchange - format: routing_key.queue
+let sub = client.subscriber().with_exchange("logs", ExchangeKind::Topic);
+sub.subscribe("api_logs", "order.*", handler).await?;
+// Queue: order.*.api_logs
+
+// Fanout exchange - format: queue
+let sub = client.subscriber().with_exchange("broadcast", ExchangeKind::Fanout);
+sub.subscribe("queue1", "", handler).await?;
+// Queue: queue1
 ```
 
-✅ **Exchange auto-created** (durable) jika belum ada  
-✅ **Queue auto-created** (durable)  
-✅ **Auto-bind** queue ke default exchange dengan routing key  
-✅ **Full auto-setup** - tidak perlu manual infrastructure
+**Format Queue:**
+- **Direct**: `routing_key + "worker"` → `order.processworker`
+- **Topic**: `routing_key.queue` → `order.*.api_queue`
+- **Fanout**: `queue` → `queue1`
 
-### Disable Auto Declare
+✅ **Auto-created** berdasarkan tipe exchange  
+✅ **Simpel untuk Direct** - tidak perlu tulis nama queue  
+✅ **Jelas untuk Topic/Fanout** - grouping jelas
+
+### Multiple Exchanges
 
 ```rust
-let subscriber = client.subscriber()
-    .with_auto_declare(false);
+use lapin::ExchangeKind;
+
+let client = AmqpClient::new("...", 10)?;
+
+// Subscriber 1 - Direct exchange (queue: routing_key + "worker")
+let sub1 = client.subscriber().with_exchange("sales", ExchangeKind::Direct);
+sub1.subscribe("job", "order.process", handler1).await?;
+// Queue: order.processworker
+
+// Subscriber 2 - Topic exchange (queue: routing_key.queue)
+let sub2 = client.subscriber().with_exchange("logs", ExchangeKind::Topic);
+sub2.subscribe("api_queue", "order.*", handler2).await?;
+// Queue: order.*.api_queue
+
+// Subscriber 3 - Fanout exchange (queue: queue saja)
+let sub3 = client.subscriber().with_exchange("broadcast", ExchangeKind::Fanout);
+sub3.subscribe("queue1", "", handler3).await?;
+// Queue: queue1
 ```
+
+**Format Queue per Tipe:**
+- **Direct**: `routing_key + "worker"` → `order.processworker`
+- **Topic**: `routing_key.queue` → `order.*.api_queue`
+- **Fanout**: `queue` → `queue1`
+
+✅ **Simple untuk Direct** - parameter queue diabaikan  
+✅ **Explicit untuk Topic/Fanout** - grouping jelas  
+✅ **Auto-create** exchange + queue + binding
 
 ## Dependency Injection
 

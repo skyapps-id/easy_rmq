@@ -1,22 +1,58 @@
 use lapin::{
-    options::*, Channel, Consumer, types::FieldTable, ExchangeKind,
+    options::*, Consumer, types::FieldTable, ExchangeKind,
 };
 use futures::StreamExt;
-use crate::{error::{Result, AmqpError}, traits::AmqpSubscriber, pool::ChannelPool};
+use crate::{error::{Result, AmqpError}, pool::ChannelPool};
+use std::sync::Arc;
 
 pub struct Subscriber {
     channel_pool: ChannelPool,
-    default_exchange: String,
+    exchange: String,
+    exchange_type: ExchangeKind,
     auto_declare: bool,
 }
 
+pub struct DirectSubscribeBuilder {
+    inner: Arc<Subscriber>,
+    routing_key: String,
+}
+
+pub struct TopicSubscribeBuilder {
+    inner: Arc<Subscriber>,
+    routing_key: String,
+    queue: String,
+}
+
+pub struct FanoutSubscribeBuilder {
+    inner: Arc<Subscriber>,
+    queue: String,
+}
+
 impl Subscriber {
-    pub fn new(channel_pool: ChannelPool, default_exchange: String) -> Self {
+    pub fn new(channel_pool: ChannelPool, exchange_type: ExchangeKind) -> Self {
+        let exchange = match exchange_type {
+            ExchangeKind::Direct => "amq.direct",
+            ExchangeKind::Topic => "amq.topic",
+            ExchangeKind::Fanout => "amq.fanout",
+            _ => "amq.direct",
+        }.to_string();
+        
         Self {
             channel_pool,
-            default_exchange,
+            exchange,
+            exchange_type,
             auto_declare: true,
         }
+    }
+
+    pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.exchange = exchange.into();
+        self
+    }
+
+    pub fn with_exchange_type(mut self, kind: ExchangeKind) -> Self {
+        self.exchange_type = kind;
+        self
     }
 
     pub fn with_auto_declare(mut self, auto_declare: bool) -> Self {
@@ -24,17 +60,40 @@ impl Subscriber {
         self
     }
 
+    pub fn direct(self, routing_key: impl Into<String>) -> DirectSubscribeBuilder {
+        DirectSubscribeBuilder {
+            inner: Arc::new(self),
+            routing_key: routing_key.into(),
+        }
+    }
+
+    pub fn topic(self, routing_key: impl Into<String>, queue: impl Into<String>) -> TopicSubscribeBuilder {
+        TopicSubscribeBuilder {
+            inner: Arc::new(self),
+            routing_key: routing_key.into(),
+            queue: queue.into(),
+        }
+    }
+
+    pub fn fanout(self, queue: impl Into<String>) -> FanoutSubscribeBuilder {
+        FanoutSubscribeBuilder {
+            inner: Arc::new(self),
+            queue: queue.into(),
+        }
+    }
+
     async fn ensure_exchange(&self, exchange: &str) -> Result<()> {
         if self.auto_declare && !exchange.is_empty() {
             let channel = self.channel_pool.get_channel().await?;
+            let exchange_type = self.exchange_type.clone();
             
-            tracing::info!("Creating exchange: {}", exchange);
+            tracing::info!("Creating exchange: {} ({:?})", exchange, exchange_type);
             
             // Try to create, ignore if already exists
             let result = channel
                 .exchange_declare(
                     exchange, 
-                    ExchangeKind::Direct, 
+                    exchange_type,
                     ExchangeDeclareOptions {
                         durable: true,
                         ..Default::default()
@@ -115,27 +174,47 @@ impl Subscriber {
 
         self.process_messages(consumer, handler).await
     }
+}
 
-    pub async fn consume_with_channel<F>(
-        channel: Channel,
-        queue: &str,
-        handler: F,
-    ) -> Result<()>
+impl DirectSubscribeBuilder {
+    pub async fn build<F>(self, handler: F) -> Result<()>
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
-        let consumer = channel
-            .basic_consume(
-                queue,
-                "",
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await.map_err(AmqpError::ConnectionError)?;
+        let queue = format!("{}.job", self.routing_key);
 
-        Self::process_messages_static(consumer, handler).await
+        self.inner.ensure_exchange(&self.inner.exchange).await?;
+        self.inner.ensure_queue(&queue).await?;
+        self.inner.ensure_binding(&queue, &self.inner.exchange, &self.routing_key).await?;
+        self.inner.consume(&queue, handler).await
     }
+}
 
+impl TopicSubscribeBuilder {
+    pub async fn build<F>(self, handler: F) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        self.inner.ensure_exchange(&self.inner.exchange).await?;
+        self.inner.ensure_queue(&self.queue).await?;
+        self.inner.ensure_binding(&self.queue, &self.inner.exchange, &self.routing_key).await?;
+        self.inner.consume(&self.queue, handler).await
+    }
+}
+
+impl FanoutSubscribeBuilder {
+    pub async fn build<F>(self, handler: F) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        self.inner.ensure_exchange(&self.inner.exchange).await?;
+        self.inner.ensure_queue(&self.queue).await?;
+        self.inner.ensure_binding(&self.queue, &self.inner.exchange, "").await?;
+        self.inner.consume(&self.queue, handler).await
+    }
+}
+
+impl Subscriber {
     async fn process_messages<F>(
         &self,
         consumer: Consumer,
@@ -182,18 +261,5 @@ impl Subscriber {
         }
 
         Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl AmqpSubscriber for Subscriber {
-    async fn subscribe<F>(&self, queue: &str, routing_key: &str, handler: F) -> Result<()>
-    where
-        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
-    {
-        self.ensure_exchange(&self.default_exchange).await?;
-        self.ensure_queue(queue).await?;
-        self.ensure_binding(queue, &self.default_exchange, routing_key).await?;
-        self.consume(queue, handler).await
     }
 }

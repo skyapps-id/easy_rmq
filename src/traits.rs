@@ -8,7 +8,4 @@ pub trait AmqpPublisher: Send + Sync {
 
 #[async_trait]
 pub trait AmqpSubscriber: Send + Sync {
-    async fn subscribe<F>(&self, queue: &str, routing_key: &str, handler: F) -> Result<()>
-    where
-        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static;
 }
