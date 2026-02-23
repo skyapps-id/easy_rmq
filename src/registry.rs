@@ -1,4 +1,4 @@
-use crate::{Result, BuiltWorker};
+use crate::{BuiltWorker, Result};
 
 pub type HandlerFn = Box<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static>;
 
@@ -11,6 +11,16 @@ impl SubscriberRegistry {
         Self {
             workers: Vec::new(),
         }
+    }
+
+    pub fn register<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(usize) -> BuiltWorker + Send + 'static,
+    {
+        let count = self.workers.len();
+        let worker = factory(count);
+        self.workers.push(worker);
+        self
     }
 
     pub fn add(mut self, worker: BuiltWorker) -> Self {
@@ -31,7 +41,9 @@ impl SubscriberRegistry {
         }
 
         for handle in handles {
-            handle.await.map_err(|e| crate::error::AmqpError::ChannelError(e.to_string()))?;
+            handle
+                .await
+                .map_err(|e| crate::error::AmqpError::ChannelError(e.to_string()))?;
         }
 
         Ok(())

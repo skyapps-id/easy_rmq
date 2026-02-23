@@ -1,6 +1,7 @@
 use easy_amqp::{AmqpClient, Result, WorkerBuilder};
-use tokio::signal;
+use lapin::ExchangeKind;
 use std::time::Duration;
+use tokio::signal;
 
 fn handle_order_event(data: Vec<u8>) -> Result<()> {
     let msg = String::from_utf8_lossy(&data);
@@ -39,17 +40,24 @@ async fn main() -> Result<()> {
 
     println!("📝 Setting up AMQP subscribers...\n");
 
-    let worker = client.registry()
-        .add({
-            WorkerBuilder::direct(client.channel_pool())
+    let pool = client.channel_pool();
+    let pool2 = pool.clone();
+
+    let worker = client
+        .registry()
+        .register(move |_count| {
+            WorkerBuilder::new(ExchangeKind::Direct)
+                .pool(pool)
                 .with_exchange("order.events.v1")
                 .queue("order.process")
                 .build(handle_order_event)
         })
-        .add({
-            WorkerBuilder::topic(client.channel_pool())
+        .register(move |_count| {
+            WorkerBuilder::new(ExchangeKind::Topic)
+                .pool(pool2)
                 .with_exchange("logs.v1")
-                .queue("order.*", "api_logs")
+                .routing_key("order.*")
+                .queue("api_logs")
                 .build(handle_log_event)
         });
 
