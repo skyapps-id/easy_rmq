@@ -2,14 +2,15 @@ use lapin::{
     options::*, BasicProperties,
 };
 use crate::{error::{Result, AmqpError}, traits::AmqpPublisher, pool::ChannelPool};
+use std::sync::Arc;
 
 pub struct Publisher {
-    channel_pool: ChannelPool,
+    channel_pool: Arc<ChannelPool>,
     exchange: String,
 }
 
 impl Publisher {
-    pub fn new(channel_pool: ChannelPool) -> Self {
+    pub fn new(channel_pool: Arc<ChannelPool>) -> Self {
         Self {
             channel_pool,
             exchange: "amq.direct".to_string(),

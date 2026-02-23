@@ -5,8 +5,9 @@ use futures::StreamExt;
 use crate::{error::{Result, AmqpError}, pool::ChannelPool};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Subscriber {
-    channel_pool: ChannelPool,
+    channel_pool: Arc<ChannelPool>,
     exchange: String,
     exchange_type: ExchangeKind,
     auto_declare: bool,
@@ -29,14 +30,14 @@ pub struct FanoutSubscribeBuilder {
 }
 
 impl Subscriber {
-    pub fn new(channel_pool: ChannelPool, exchange_type: ExchangeKind) -> Self {
+    pub fn new(channel_pool: Arc<ChannelPool>, exchange_type: ExchangeKind) -> Self {
         let exchange = match exchange_type {
             ExchangeKind::Direct => "amq.direct",
             ExchangeKind::Topic => "amq.topic",
             ExchangeKind::Fanout => "amq.fanout",
             _ => "amq.direct",
         }.to_string();
-        
+
         Self {
             channel_pool,
             exchange,
@@ -47,11 +48,6 @@ impl Subscriber {
 
     pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
         self.exchange = exchange.into();
-        self
-    }
-
-    pub fn with_exchange_type(mut self, kind: ExchangeKind) -> Self {
-        self.exchange_type = kind;
         self
     }
 

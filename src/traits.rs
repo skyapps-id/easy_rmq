@@ -5,7 +5,3 @@ use crate::error::Result;
 pub trait AmqpPublisher: Send + Sync {
     async fn publish(&self, exchange: &str, routing_key: &str, payload: &[u8]) -> Result<()>;
 }
-
-#[async_trait]
-pub trait AmqpSubscriber: Send + Sync {
-}

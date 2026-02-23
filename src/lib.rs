@@ -3,12 +3,16 @@ pub mod traits;
 pub mod pool;
 pub mod publisher;
 pub mod subscriber;
+pub mod registry;
+pub mod worker;
 
 pub use error::{AmqpError, Result};
-pub use traits::{AmqpPublisher, AmqpSubscriber};
+pub use traits::AmqpPublisher;
 pub use pool::{create_pool, AmqpPool, ChannelPool, AmqpConnectionManager};
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;
+pub use registry::{SubscriberRegistry, HandlerFn};
+pub use worker::{WorkerBuilder, BuiltWorker, DirectWorkerBuilder, TopicWorkerBuilder, FanoutWorkerBuilder};
 
 use std::sync::Arc;
 
@@ -20,7 +24,7 @@ impl AmqpClient {
     pub fn new(uri: String, max_size: usize) -> Result<Self> {
         let pool = Arc::new(create_pool(uri, max_size)?);
         let channel_pool = Arc::new(ChannelPool::new(pool));
-        
+
         Ok(Self {
             channel_pool,
         })
@@ -31,11 +35,19 @@ impl AmqpClient {
     }
 
     pub fn publisher(&self) -> Publisher {
-        Publisher::new(self.channel_pool.as_ref().clone())
+        Publisher::new(self.channel_pool.clone())
     }
 
     pub fn subscriber(&self, kind: lapin::ExchangeKind) -> Subscriber {
-        Subscriber::new(self.channel_pool.as_ref().clone(), kind)
+        Subscriber::new(self.channel_pool.clone(), kind)
+    }
+
+    pub fn registry(&self) -> SubscriberRegistry {
+        SubscriberRegistry::new()
+    }
+
+    pub fn channel_pool(&self) -> Arc<ChannelPool> {
+        self.channel_pool.clone()
     }
 }
 

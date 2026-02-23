@@ -69,11 +69,11 @@ impl ChannelPool {
 
     pub async fn get_channel(&self) -> Result<Channel> {
         let mut cached = self.channel.lock().await;
-        
-        if let Some(channel) = cached.as_ref() {
-            if channel.status().connected() {
-                return Ok(channel.clone());
-            }
+
+        if let Some(channel) = cached.as_ref()
+            && channel.status().connected()
+        {
+            return Ok(channel.clone());
         }
 
         let conn = self.pool.get().await
