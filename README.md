@@ -1,16 +1,17 @@
 # lib-amqp
 
-Rust AMQP library dengan connection pool, publisher, subscriber, dan support untuk dependency injection.
+Rust AMQP library with connection pool, publisher, subscriber, and dependency injection support.
 
-## Fitur
+## Features
 
-- **Connection Pool**: Mengelola koneksi AMQP dengan efisien menggunakan deadpool
-- **Publisher**: Mengirim pesan ke exchange dengan routing key
-- **Subscriber**: Menerima pesan dari queue dengan handler
-- **Auto Register**: Otomatis membuat exchange dan queue
-- **Dependency Injection**: Support untuk trait-based DI pattern
-- **Type Safe**: Error handling yang kuat dengan thiserror
-- **Async**: Full async support menggunakan tokio
+- **Connection Pool**: Efficiently manages AMQP connections using deadpool
+- **Publisher**: Send messages to exchanges with routing keys
+- **Subscriber**: Receive messages from queues with handlers
+- **Worker Registry**: Register and manage multiple workers with a clean pattern
+- **Auto Setup**: Automatically creates exchanges and queues
+- **Dependency Injection**: Support for trait-based DI pattern
+- **Type Safe**: Strong error handling with thiserror
+- **Async**: Full async support using tokio
 
 ## Installation
 
@@ -21,7 +22,7 @@ easy_amqp = { path = "./lib-amqp" }
 
 ## Quick Start
 
-### 1. Jalankan RabbitMQ
+### 1. Start RabbitMQ
 
 ```bash
 docker run -d --name rabbitmq \
@@ -32,35 +33,37 @@ docker run -d --name rabbitmq \
 
 ### 2. Subscriber Example (Run First!)
 
-Buka terminal 1 - Subscriber setup queue & binding:
+Open terminal 1 - Subscriber sets up queue & binding:
 ```bash
 cargo run --example subscriber
 ```
 
 ### 3. Publisher Example (Run Second)
 
-Buka terminal 2:
+Open terminal 2:
 ```bash
 cargo run --example publisher
 ```
 
-Press `Ctrl+C` pada subscriber untuk graceful shutdown.
+Press `Ctrl+C` on subscriber for graceful shutdown.
 
 ## Architecture & Best Practices
 
 🎯 **Simple & Clean:**
 - **Default Exchange**: `amq.direct` (RabbitMQ built-in)
-- **Publisher**: Auto-create exchange + kirim pesan
+- **Publisher**: Auto-create exchange + send messages
 - **Subscriber**: Auto-create exchange + queue + binding
-- **Full Auto-Setup**: Tidak perlu manual infrastructure
+- **Worker Registry**: Register multiple workers with clean pattern
+- **Full Auto-Setup**: No manual infrastructure needed
 
-Ini mengikuti AMQP best practice:
-- Producer → Kirim ke exchange (auto-created jika belum ada)
-- Consumer → Auto-create semua + consume
+This follows AMQP best practices:
+- Producer → Send to exchange (auto-created if not exists)
+- Consumer → Auto-create everything + consume
+- Registry → Manage multiple workers with consistent pattern
 
-## Penggunaan Dasar
+## Basic Usage
 
-### Membuat Client
+### Creating a Client
 
 ```rust
 use easy_amqp::AmqpClient;
@@ -71,14 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "amqp://guest:guest@localhost:5672".to_string(),
         10  // max pool size
     )?;
-    
+
     Ok(())
 }
 ```
 
 ### Publisher
 
-Publisher **simple** - kirim ke default exchange:
+Publisher **simple** - send to default exchange:
 
 ```rust
 use easy_amqp::AmqpClient;
@@ -108,9 +111,9 @@ let order = Order {
 publisher.publish_json("order.created", &order).await?;
 ```
 
-✅ **Auto kirim ke default exchange** (`amq.direct`)  
-✅ **Auto-create exchange** jika belum ada (durable)  
-✅ **Tidak perlu manual setup**
+✅ **Auto send to default exchange** (`amq.direct`)
+✅ **Auto-create exchange** if not exists (durable)
+✅ **No manual setup needed**
 
 ### Multiple Exchanges
 
@@ -137,80 +140,119 @@ let pub5 = client.publisher().with_direct("orders");
 let pub6 = client.publisher().with_fanout("events");
 ```
 
-✅ **Explicit** - tipe exchange jelas dari parameter  
-✅ **Fleksibel** - Direct, Topic, Fanout, Headers  
-✅ **Auto-create** exchange dengan tipe yang sesuai
+✅ **Explicit** - exchange type clear from parameters
+✅ **Flexible** - Direct, Topic, Fanout, Headers
+✅ **Auto-create** exchange with appropriate type
 
-### Subscriber
+### Subscriber with Worker Registry
 
-Subscriber **auto-create queue** dengan nama terformat:
-
-```rust
-use easy_amqp::{AmqpClient, AmqpSubscriber};
-use lapin::ExchangeKind;
-
-let client = AmqpClient::new("amqp://guest:guest@localhost:5672".to_string(), 10)?;
-
-// Direct exchange - format: routing_key + "worker"
-let sub = client.subscriber().with_exchange("sales", ExchangeKind::Direct);
-sub.subscribe("job", "order.process", handler).await?;
-// Queue: order.processworker
-
-// Topic exchange - format: routing_key.queue
-let sub = client.subscriber().with_exchange("logs", ExchangeKind::Topic);
-sub.subscribe("api_logs", "order.*", handler).await?;
-// Queue: order.*.api_logs
-
-// Fanout exchange - format: queue
-let sub = client.subscriber().with_exchange("broadcast", ExchangeKind::Fanout);
-sub.subscribe("queue1", "", handler).await?;
-// Queue: queue1
-```
-
-**Format Queue:**
-- **Direct**: `routing_key + "worker"` → `order.processworker`
-- **Topic**: `routing_key.queue` → `order.*.api_queue`
-- **Fanout**: `queue` → `queue1`
-
-✅ **Auto-created** berdasarkan tipe exchange  
-✅ **Simpel untuk Direct** - tidak perlu tulis nama queue  
-✅ **Jelas untuk Topic/Fanout** - grouping jelas
-
-### Multiple Exchanges
+Use `SubscriberRegistry` to manage multiple workers:
 
 ```rust
+use easy_amqp::{AmqpClient, SubscriberRegistry, WorkerBuilder};
 use lapin::ExchangeKind;
 
-let client = AmqpClient::new("...", 10)?;
+#[tokio::main]
+async fn main() -> easy_amqp::Result<()> {
+    let client = AmqpClient::new("amqp://admin:password@localhost:5672".to_string(), 10)?;
+    let pool = client.channel_pool();
 
-// Subscriber 1 - Direct exchange (queue: routing_key + "worker")
-let sub1 = client.subscriber().with_exchange("sales", ExchangeKind::Direct);
-sub1.subscribe("job", "order.process", handler1).await?;
-// Queue: order.processworker
+    let worker = SubscriberRegistry::new()
+        .register({
+            let pool = pool.clone();
+            move |_count| {
+                println!("📝 Registering worker #{}", _count);
+                WorkerBuilder::new(ExchangeKind::Direct)
+                    .pool(pool)
+                    .with_exchange("order.events.v1")
+                    .queue("order.process")
+                    .build(handle_order_event)
+            }
+        })
+        .register({
+            let pool = pool.clone();
+            move |_count| {
+                println!("📝 Registering worker #{}", _count);
+                WorkerBuilder::new(ExchangeKind::Topic)
+                    .pool(pool)
+                    .with_exchange("logs.v1")
+                    .routing_key("order.*")
+                    .queue("api_logs")
+                    .build(handle_log_event)
+            }
+        });
 
-// Subscriber 2 - Topic exchange (queue: routing_key.queue)
-let sub2 = client.subscriber().with_exchange("logs", ExchangeKind::Topic);
-sub2.subscribe("api_queue", "order.*", handler2).await?;
-// Queue: order.*.api_queue
+    worker.run().await?;
+    Ok(())
+}
 
-// Subscriber 3 - Fanout exchange (queue: queue saja)
-let sub3 = client.subscriber().with_exchange("broadcast", ExchangeKind::Fanout);
-sub3.subscribe("queue1", "", handler3).await?;
-// Queue: queue1
+fn handle_order_event(data: Vec<u8>) -> easy_amqp::Result<()> {
+    let msg = String::from_utf8_lossy(&data);
+    println!("📦 Order: {}", msg);
+    Ok(())
+}
+
+fn handle_log_event(data: Vec<u8>) -> easy_amqp::Result<()> {
+    let msg = String::from_utf8_lossy(&data);
+    println!("📊 Log: {}", msg);
+    Ok(())
+}
 ```
 
-**Format Queue per Tipe:**
-- **Direct**: `routing_key + "worker"` → `order.processworker`
-- **Topic**: `routing_key.queue` → `order.*.api_queue`
-- **Fanout**: `queue` → `queue1`
+**Queue Format per Exchange Type:**
 
-✅ **Simple untuk Direct** - parameter queue diabaikan  
-✅ **Explicit untuk Topic/Fanout** - grouping jelas  
-✅ **Auto-create** exchange + queue + binding
+| Exchange | Parameter | Queue Name | Routing Key |
+|----------|-----------|------------|-------------|
+| **Direct** | `.queue("rk")` | `rk.job` | `rk` |
+| **Topic** | `.routing_key("rk")` + `.queue("q")` | `q` | `rk` |
+| **Fanout** | `.queue("q")` | `q` | `""` |
+
+✅ **Auto-created** exchange + queue + binding
+✅ **Direct**: queue auto-formatted with `.job` suffix
+✅ **Topic/Fanout**: full control over queue name
+
+### Exchange Types Detail
+
+**Direct Exchange** - Queue name auto-formatted with `.job` suffix:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Direct)
+    .pool(pool)
+    .with_exchange("order.events")
+    .queue("order.created")  // routing_key
+    .build(handler)
+// Queue: "order.created.job"
+// Binding: queue_bind("order.created.job", "order.events", "order.created")
+```
+
+**Topic Exchange** - Separate routing key and queue:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Topic)
+    .pool(pool)
+    .with_exchange("logs")
+    .routing_key("order.*")  // routing pattern
+    .queue("api_logs")       // queue name
+    .build(handler)
+// Queue: "api_logs"
+// Binding: queue_bind("api_logs", "logs", "order.*")
+```
+
+**Fanout Exchange** - Broadcast to all queues:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Fanout)
+    .pool(pool)
+    .with_exchange("events")
+    .queue("notification_q")
+    .build(handler)
+// Queue: "notification_q"
+// Binding: queue_bind("notification_q", "events", "")
+```
 
 ## Dependency Injection
 
-Library ini support dependency injection menggunakan traits:
+This library supports dependency injection using traits:
 
 ```rust
 use easy_amqp::{AmqpPublisher, Result};
@@ -224,7 +266,7 @@ impl OrderService {
     fn new(publisher: Arc<dyn AmqpPublisher>) -> Self {
         Self { publisher }
     }
-    
+
     async fn create_order(&self, order: Order) -> Result<()> {
         let payload = serde_json::to_vec(&order)?;
         self.publisher.publish("orders", "order.created", &payload).await?;
@@ -237,36 +279,18 @@ let publisher: Arc<dyn AmqpPublisher> = Arc::new(client.publisher());
 let order_service = OrderService::new(publisher);
 ```
 
-## Queue Management
-
-Manual setup exchange dan queue:
-
-```rust
-let client = AmqpClient::new("amqp://guest:guest@localhost:5672".to_string(), 10)?;
-
-// Membuat queue
-client.create_queue("my_queue", true).await?;
-
-// Membuat exchange
-client.create_exchange("my_exchange", lapin::ExchangeKind::Direct).await?;
-
-// Binding queue ke exchange
-client.bind_queue("my_queue", "my_exchange", "routing.key").await?;
-```
-
 ## Examples
 
-Lihat folder `examples/` untuk contoh penggunaan:
-- `publisher.rs` - Publisher murni (hanya kirim pesan)
-- `subscriber.rs` - Subscriber dengan full setup & graceful shutdown
-- `di_example.rs` - Contoh dependency injection pattern
+See `examples/` folder for usage examples:
+- `publisher.rs` - Publisher with various exchange types
+- `subscriber.rs` - Multi-worker with SubscriberRegistry
 
-Jalankan example:
+Run examples:
 ```bash
-# Terminal 1 - Start subscriber dulu
+# Terminal 1 - Start subscriber first
 cargo run --example subscriber
 
-# Terminal 2 - Lalu publisher
+# Terminal 2 - Then publisher
 cargo run --example publisher
 ```
 
@@ -279,7 +303,7 @@ cargo test
 ## Requirements
 
 - Rust 1.70+
-- RabbitMQ server (atau Docker)
+- RabbitMQ server (or Docker)
 
 ## License
 
