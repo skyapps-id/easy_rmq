@@ -1,10 +1,10 @@
 [package]
-name = "easy_amqp"
+name = "easy_rmq"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "easy_amqp"
+name = "easy_rmq"
 path = "src/lib.rs"
 
 [dependencies]

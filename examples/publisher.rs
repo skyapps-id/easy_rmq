@@ -1,4 +1,4 @@
-use easy_amqp::{AmqpClient, Result};
+use easy_rmq::{AmqpClient, Result};
 use std::time::Duration;
 
 #[tokio::main]

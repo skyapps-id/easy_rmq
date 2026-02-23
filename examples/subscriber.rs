@@ -1,4 +1,4 @@
-use easy_amqp::{AmqpClient, Result, SubscriberRegistry, WorkerBuilder};
+use easy_rmq::{AmqpClient, Result, SubscriberRegistry, WorkerBuilder};
 use lapin::ExchangeKind;
 use std::time::Duration;
 use tokio::signal;

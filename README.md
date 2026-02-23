@@ -1,4 +1,4 @@
-# lib-amqp
+# easy_rmq
 
 Rust AMQP library with connection pool, publisher, subscriber, and dependency injection support.
 
@@ -17,7 +17,7 @@ Rust AMQP library with connection pool, publisher, subscriber, and dependency in
 
 ```toml
 [dependencies]
-easy_amqp = { path = "./lib-amqp" }
+easy_rmq = { path = "./easy_rmq" }
 ```
 
 ## Quick Start
@@ -66,7 +66,7 @@ This follows AMQP best practices:
 ### Creating a Client
 
 ```rust
-use easy_amqp::AmqpClient;
+use easy_rmq::AmqpClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Publisher **simple** - send to default exchange:
 
 ```rust
-use easy_amqp::AmqpClient;
+use easy_rmq::AmqpClient;
 
 let client = AmqpClient::new("amqp://guest:guest@localhost:5672".to_string(), 10)?;
 
@@ -149,11 +149,11 @@ let pub6 = client.publisher().with_fanout("events");
 Use `SubscriberRegistry` to manage multiple workers:
 
 ```rust
-use easy_amqp::{AmqpClient, SubscriberRegistry, WorkerBuilder};
+use easy_rmq::{AmqpClient, SubscriberRegistry, WorkerBuilder};
 use lapin::ExchangeKind;
 
 #[tokio::main]
-async fn main() -> easy_amqp::Result<()> {
+async fn main() -> easy_rmq::Result<()> {
     let client = AmqpClient::new("amqp://admin:password@localhost:5672".to_string(), 10)?;
     let pool = client.channel_pool();
 
@@ -186,13 +186,13 @@ async fn main() -> easy_amqp::Result<()> {
     Ok(())
 }
 
-fn handle_order_event(data: Vec<u8>) -> easy_amqp::Result<()> {
+fn handle_order_event(data: Vec<u8>) -> easy_rmq::Result<()> {
     let msg = String::from_utf8_lossy(&data);
     println!("📦 Order: {}", msg);
     Ok(())
 }
 
-fn handle_log_event(data: Vec<u8>) -> easy_amqp::Result<()> {
+fn handle_log_event(data: Vec<u8>) -> easy_rmq::Result<()> {
     let msg = String::from_utf8_lossy(&data);
     println!("📊 Log: {}", msg);
     Ok(())
@@ -255,7 +255,7 @@ WorkerBuilder::new(ExchangeKind::Fanout)
 This library supports dependency injection using traits:
 
 ```rust
-use easy_amqp::{AmqpPublisher, Result};
+use easy_rmq::{AmqpPublisher, Result};
 use std::sync::Arc;
 
 struct OrderService {

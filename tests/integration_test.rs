@@ -1,4 +1,4 @@
-use easy_amqp::{AmqpClient, AmqpPublisher};
+use easy_rmq::{AmqpClient, AmqpPublisher};
 use std::sync::Arc;
 
 #[test]
