@@ -15,10 +15,10 @@ fn test_client_has_publisher() {
 }
 
 #[test]
-fn test_client_has_subscriber() {
+fn test_client_has_channel_pool() {
     let client = AmqpClient::new("amqp://guest:guest@localhost:5672".to_string(), 10).unwrap();
-    let subscriber = client.subscriber(lapin::ExchangeKind::Direct);
-    drop(subscriber);
+    let pool = client.channel_pool();
+    drop(pool);
 }
 
 #[test]

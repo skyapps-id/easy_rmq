@@ -38,14 +38,6 @@ impl AmqpClient {
         Publisher::new(self.channel_pool.clone())
     }
 
-    pub fn subscriber(&self, kind: lapin::ExchangeKind) -> Subscriber {
-        Subscriber::new(self.channel_pool.clone(), kind)
-    }
-
-    pub fn registry(&self) -> SubscriberRegistry {
-        SubscriberRegistry::new()
-    }
-
     pub fn channel_pool(&self) -> Arc<ChannelPool> {
         self.channel_pool.clone()
     }

@@ -1,4 +1,4 @@
-use easy_amqp::{AmqpClient, Result, WorkerBuilder};
+use easy_amqp::{AmqpClient, Result, SubscriberRegistry, WorkerBuilder};
 use lapin::ExchangeKind;
 use std::time::Duration;
 use tokio::signal;
@@ -41,24 +41,28 @@ async fn main() -> Result<()> {
     println!("📝 Setting up AMQP subscribers...\n");
 
     let pool = client.channel_pool();
-    let pool2 = pool.clone();
 
-    let worker = client
-        .registry()
-        .register(move |_count| {
-            WorkerBuilder::new(ExchangeKind::Direct)
-                .pool(pool)
-                .with_exchange("order.events.v1")
-                .queue("order.process")
-                .build(handle_order_event)
+    let worker = SubscriberRegistry::new()
+        .register({
+            let pool = pool.clone();
+            move |_count| {
+                WorkerBuilder::new(ExchangeKind::Direct)
+                    .pool(pool)
+                    .with_exchange("order.events.v1")
+                    .queue("order.process")
+                    .build(handle_order_event)
+            }
         })
-        .register(move |_count| {
-            WorkerBuilder::new(ExchangeKind::Topic)
-                .pool(pool2)
-                .with_exchange("logs.v1")
-                .routing_key("order.*")
-                .queue("api_logs")
-                .build(handle_log_event)
+        .register({
+            let pool = pool.clone();
+            move |_count| {
+                WorkerBuilder::new(ExchangeKind::Topic)
+                    .pool(pool)
+                    .with_exchange("logs.v1")
+                    .routing_key("order.*")
+                    .queue("api_logs")
+                    .build(handle_log_event)
+            }
         });
 
     println!("\n(Press Ctrl+C to exit)\n");
