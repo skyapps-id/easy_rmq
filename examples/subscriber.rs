@@ -13,8 +13,8 @@ fn handle_order_event(data: Vec<u8>) -> Result<()> {
 
     let order_id = event["id"].as_str().unwrap_or("unknown");
     let total = event["total"].as_f64().unwrap_or(0.0);
-    println!("✅ [Order] Processed: {} | Total: ${}", order_id, total);
-    Ok(())
+    println!("❌ [Order] Processing failed: {} | Total: ${}", order_id, total);
+    Err(easy_rmq::AmqpError::ChannelError("Simulated processing error".to_string()))
 }
 
 fn handle_log_event(data: Vec<u8>) -> Result<()> {
@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
                     .pool(pool)
                     .with_exchange("order.events.v1")
                     .queue("order.process")
+                    .retry(3, 5000)
                     .build(handle_order_event)
             }
         })
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
                     .with_exchange("logs.v1")
                     .routing_key("order.*")
                     .queue("api_logs")
+                    .retry(2, 10000)
                     .build(handle_log_event)
             }
         });

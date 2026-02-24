@@ -3,8 +3,9 @@ use crate::{
     pool::ChannelPool,
 };
 use futures::StreamExt;
-use lapin::{Consumer, ExchangeKind, options::*, types::FieldTable};
+use lapin::{Consumer, ExchangeKind, options::*, types::AMQPValue, types::FieldTable};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Subscriber {
@@ -12,6 +13,8 @@ pub struct Subscriber {
     exchange: String,
     exchange_type: ExchangeKind,
     auto_declare: bool,
+    retry_max_retries: Option<u32>,
+    retry_delay: Option<Duration>,
 }
 
 pub struct DirectSubscribeBuilder {
@@ -46,6 +49,8 @@ impl Subscriber {
             exchange,
             exchange_type,
             auto_declare: true,
+            retry_max_retries: None,
+            retry_delay: None,
         }
     }
 
@@ -56,6 +61,12 @@ impl Subscriber {
 
     pub fn with_auto_declare(mut self, auto_declare: bool) -> Self {
         self.auto_declare = auto_declare;
+        self
+    }
+
+    pub fn with_retry(mut self, max_retries: u32, delay: Duration) -> Self {
+        self.retry_max_retries = Some(max_retries);
+        self.retry_delay = Some(delay);
         self
     }
 
@@ -159,11 +170,72 @@ impl Subscriber {
         Ok(())
     }
 
+    async fn setup_retry_infrastructure(&self, main_queue: &str) -> Result<Option<String>> {
+        if let (Some(_max_retries), Some(delay)) = (self.retry_max_retries, self.retry_delay) {
+            let retry_queue = format!("{}.retry", main_queue);
+            let dlq_queue = format!("{}.dlq", main_queue);
+
+            let delay_ms = delay.as_millis() as u32;
+
+            let mut retry_args = FieldTable::default();
+            retry_args.insert("x-dead-letter-exchange".into(), AMQPValue::LongString("".into()));
+            retry_args.insert("x-dead-letter-routing-key".into(), AMQPValue::LongString(main_queue.into()));
+            retry_args.insert("x-message-ttl".into(), AMQPValue::LongLongInt(delay_ms as i64));
+
+            let retry_queue_ok = match self.try_declare_queue(&retry_queue, retry_args).await {
+                Ok(_) => true,
+                Err(e) if e.to_string().contains("406") || e.to_string().contains("PRECONDITION_FAILED") => {
+                    tracing::warn!("⚠️  Retry queue '{}' already exists with different arguments", retry_queue);
+                    false
+                }
+                Err(e) => return Err(e),
+            };
+
+            match self.try_declare_queue(&dlq_queue, FieldTable::default()).await {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("406") || e.to_string().contains("PRECONDITION_FAILED") => {
+                    tracing::warn!("⚠️  DLQ '{}' already exists with different arguments", dlq_queue);
+                }
+                Err(e) => return Err(e),
+            }
+
+            if retry_queue_ok {
+                tracing::info!("✓ Retry infrastructure created for '{}'", main_queue);
+            } else {
+                tracing::warn!("⚠️  Using existing retry infrastructure for '{}' (may not work as expected)", main_queue);
+            }
+
+            Ok(Some(retry_queue))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn try_declare_queue(&self, queue: &str, args: FieldTable) -> Result<()> {
+        let channel = self.channel_pool.get_channel().await?;
+
+        channel
+            .queue_declare(
+                queue,
+                QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                args,
+            )
+            .await
+            .map_err(AmqpError::ConnectionError)?;
+
+        Ok(())
+    }
+
     pub async fn consume<F>(&self, queue: &str, handler: F) -> Result<()>
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
         self.ensure_queue(queue).await?;
+
+        let retry_queue = self.setup_retry_infrastructure(queue).await?;
 
         let channel = self.channel_pool.get_channel().await?;
 
@@ -177,7 +249,119 @@ impl Subscriber {
             .await
             .map_err(AmqpError::ConnectionError)?;
 
-        self.process_messages(consumer, handler).await
+        self.process_messages(consumer, handler, retry_queue, queue).await
+    }
+}
+
+impl Subscriber {
+    async fn process_messages<F>(&self, consumer: Consumer, handler: F, retry_queue: Option<String>, main_queue: &str) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        let max_retries = self.retry_max_retries.unwrap_or(0);
+        Self::process_messages_static(consumer, handler, retry_queue, self.channel_pool.clone(), max_retries, main_queue).await
+    }
+
+    async fn process_messages_static<F>(mut consumer: Consumer, handler: F, retry_queue: Option<String>, channel_pool: Arc<ChannelPool>, max_retries: u32, main_queue: &str) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        while let Some(delivery_result) = consumer.next().await {
+            match delivery_result {
+                Ok(delivery) => {
+                    let data = delivery.data.clone();
+                    let acker = delivery.acker;
+
+                    match handler(data) {
+                        Ok(_) => {
+                            acker
+                                .ack(BasicAckOptions::default())
+                                .await
+                                .map_err(AmqpError::ConnectionError)?;
+                        }
+                        Err(e) => {
+                            tracing::error!("Handler error: {:?}", e);
+
+                            if let Some(ref retry_q) = retry_queue {
+                                let headers = delivery.properties.headers().clone();
+                                let retry_count = headers
+                                    .and_then(|h| h.inner().get("x-retry-count").cloned())
+                                    .and_then(|v| {
+                                        match v {
+                                            AMQPValue::LongLongInt(n) => Some(n as u32),
+                                            AMQPValue::ShortShortInt(n) => Some(n as u32),
+                                            AMQPValue::ShortInt(n) => Some(n as u32),
+                                            AMQPValue::LongInt(n) => Some(n as u32),
+                                            _ => None,
+                                        }
+                                    })
+                                    .unwrap_or(0);
+
+                                if retry_count < max_retries {
+                                    let channel = channel_pool.get_channel().await?;
+                                    let mut new_headers = FieldTable::default();
+                                    new_headers.insert("x-retry-count".into(), AMQPValue::LongLongInt((retry_count + 1) as i64));
+
+                                    let publish_props = lapin::BasicProperties::default()
+                                        .with_headers(new_headers)
+                                        .with_delivery_mode(2);
+
+                                    channel
+                                        .basic_publish(
+                                            "",
+                                            retry_q,
+                                            BasicPublishOptions::default(),
+                                            &delivery.data,
+                                            publish_props,
+                                        )
+                                        .await
+                                        .map_err(AmqpError::ConnectionError)?;
+
+                                    tracing::warn!("🔄 Message sent to retry queue (attempt {}/{})", retry_count + 1, max_retries);
+
+                                    acker
+                                        .ack(BasicAckOptions::default())
+                                        .await
+                                        .map_err(AmqpError::ConnectionError)?;
+                                } else {
+                                    let dlq_queue = format!("{}.dlq", main_queue);
+                                    let channel = channel_pool.get_channel().await?;
+
+                                    channel
+                                        .basic_publish(
+                                            "",
+                                            &dlq_queue,
+                                            BasicPublishOptions::default(),
+                                            &delivery.data,
+                                            lapin::BasicProperties::default()
+                                                .with_delivery_mode(2),
+                                        )
+                                        .await
+                                        .map_err(AmqpError::ConnectionError)?;
+
+                                    tracing::error!("❌ Max retries exceeded ({}/{}), sent to DLQ: {}", retry_count, max_retries, dlq_queue);
+
+                                    acker
+                                        .ack(BasicAckOptions::default())
+                                        .await
+                                        .map_err(AmqpError::ConnectionError)?;
+                                }
+                            } else {
+                                acker
+                                    .nack(BasicNackOptions::default())
+                                    .await
+                                    .map_err(AmqpError::ConnectionError)?;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Consumer error: {:?}", e);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -220,50 +404,5 @@ impl FanoutSubscribeBuilder {
             .ensure_binding(&self.queue, &self.inner.exchange, "")
             .await?;
         self.inner.consume(&self.queue, handler).await
-    }
-}
-
-impl Subscriber {
-    async fn process_messages<F>(&self, consumer: Consumer, handler: F) -> Result<()>
-    where
-        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
-    {
-        Self::process_messages_static(consumer, handler).await
-    }
-
-    async fn process_messages_static<F>(mut consumer: Consumer, handler: F) -> Result<()>
-    where
-        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
-    {
-        while let Some(delivery_result) = consumer.next().await {
-            match delivery_result {
-                Ok(delivery) => {
-                    let data = delivery.data;
-
-                    let acker = delivery.acker;
-
-                    match handler(data) {
-                        Ok(_) => {
-                            acker
-                                .ack(BasicAckOptions::default())
-                                .await
-                                .map_err(AmqpError::ConnectionError)?;
-                        }
-                        Err(e) => {
-                            tracing::error!("Handler error: {:?}", e);
-                            acker
-                                .nack(BasicNackOptions::default())
-                                .await
-                                .map_err(AmqpError::ConnectionError)?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Consumer error: {:?}", e);
-                }
-            }
-        }
-
-        Ok(())
     }
 }

@@ -1,6 +1,7 @@
 use crate::{ChannelPool, HandlerFn, Result, Subscriber};
 use lapin::ExchangeKind;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct WorkerBuilder;
 
@@ -28,6 +29,9 @@ pub struct WorkerBuilderWithKind {
     channel_pool: Option<Arc<ChannelPool>>,
     routing_key: Option<String>,
     queue: Option<String>,
+    retry_enabled: bool,
+    max_retries: u32,
+    retry_delay: Duration,
 }
 
 impl WorkerBuilderWithKind {
@@ -46,6 +50,9 @@ impl WorkerBuilderWithKind {
             channel_pool: None,
             routing_key: None,
             queue: None,
+            retry_enabled: false,
+            max_retries: 3,
+            retry_delay: Duration::from_secs(60),
         }
     }
 
@@ -69,6 +76,13 @@ impl WorkerBuilderWithKind {
         self
     }
 
+    pub fn retry(mut self, max_retries: u32, delay_ms: u64) -> Self {
+        self.retry_enabled = true;
+        self.max_retries = max_retries;
+        self.retry_delay = Duration::from_millis(delay_ms);
+        self
+    }
+
     pub fn build<F>(self, handler: F) -> BuiltWorker
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
@@ -78,6 +92,15 @@ impl WorkerBuilderWithKind {
         let subscriber =
             Subscriber::new(pool, self.exchange_kind.clone()).with_exchange(&self.exchange);
 
+        let retry_config = if self.retry_enabled {
+            Some(RetryConfig {
+                max_retries: self.max_retries,
+                delay: self.retry_delay,
+            })
+        } else {
+            None
+        };
+
         match self.exchange_kind {
             ExchangeKind::Direct => {
                 let queue = self.queue.expect("queue required for Direct");
@@ -86,6 +109,7 @@ impl WorkerBuilderWithKind {
                     config: WorkerConfig::Direct {
                         queue,
                         handler: Box::new(handler),
+                        retry_config,
                     },
                 }
             }
@@ -98,6 +122,7 @@ impl WorkerBuilderWithKind {
                         routing_key,
                         queue,
                         handler: Box::new(handler),
+                        retry_config,
                     },
                 }
             }
@@ -108,6 +133,7 @@ impl WorkerBuilderWithKind {
                     config: WorkerConfig::Fanout {
                         queue,
                         handler: Box::new(handler),
+                        retry_config,
                     },
                 }
             }
@@ -121,19 +147,28 @@ pub struct BuiltWorker {
     config: WorkerConfig,
 }
 
+#[derive(Clone)]
+pub struct RetryConfig {
+    pub max_retries: u32,
+    pub delay: Duration,
+}
+
 pub enum WorkerConfig {
     Direct {
         queue: String,
         handler: HandlerFn,
+        retry_config: Option<RetryConfig>,
     },
     Topic {
         routing_key: String,
         queue: String,
         handler: HandlerFn,
+        retry_config: Option<RetryConfig>,
     },
     Fanout {
         queue: String,
         handler: HandlerFn,
+        retry_config: Option<RetryConfig>,
     },
 }
 
@@ -173,6 +208,7 @@ impl DirectWorkerBuilder {
             config: WorkerConfig::Direct {
                 queue: self.queue,
                 handler: Box::new(handler),
+                retry_config: None,
             },
         }
     }
@@ -218,6 +254,7 @@ impl TopicWorkerBuilder {
                 routing_key: self.routing_key,
                 queue: self.queue,
                 handler: Box::new(handler),
+                retry_config: None,
             },
         }
     }
@@ -259,6 +296,7 @@ impl FanoutWorkerBuilder {
             config: WorkerConfig::Fanout {
                 queue: self.queue,
                 handler: Box::new(handler),
+                retry_config: None,
             },
         }
     }
@@ -267,21 +305,45 @@ impl FanoutWorkerBuilder {
 impl BuiltWorker {
     pub async fn run(self) -> Result<()> {
         match self.config {
-            WorkerConfig::Direct { queue, handler } => {
-                self.subscriber.direct(&queue).build(handler).await
+            WorkerConfig::Direct {
+                queue,
+                handler,
+                retry_config,
+            } => {
+                let subscriber = if let Some(rc) = retry_config {
+                    self.subscriber.with_retry(rc.max_retries, rc.delay)
+                } else {
+                    self.subscriber
+                };
+                subscriber.direct(&queue).build(handler).await
             }
             WorkerConfig::Topic {
                 routing_key,
                 queue,
                 handler,
+                retry_config,
             } => {
-                self.subscriber
+                let subscriber = if let Some(rc) = retry_config {
+                    self.subscriber.with_retry(rc.max_retries, rc.delay)
+                } else {
+                    self.subscriber
+                };
+                subscriber
                     .topic(&routing_key, &queue)
                     .build(handler)
                     .await
             }
-            WorkerConfig::Fanout { queue, handler } => {
-                self.subscriber.fanout(&queue).build(handler).await
+            WorkerConfig::Fanout {
+                queue,
+                handler,
+                retry_config,
+            } => {
+                let subscriber = if let Some(rc) = retry_config {
+                    self.subscriber.with_retry(rc.max_retries, rc.delay)
+                } else {
+                    self.subscriber
+                };
+                subscriber.fanout(&queue).build(handler).await
             }
         }
     }
