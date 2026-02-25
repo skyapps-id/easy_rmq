@@ -9,6 +9,9 @@ Rust AMQP library with connection pool, publisher, subscriber, and dependency in
 - **Subscriber**: Receive messages from queues with handlers
 - **Worker Registry**: Register and manage multiple workers with a clean pattern
 - **Auto Setup**: Automatically creates exchanges and queues
+- **Retry Mechanism**: Automatic retry with delay for failed messages
+- **Prefetch Control**: AMQP prefetch (QoS) configuration
+- **Parallel Processing**: Configurable worker concurrency with async/blocking spawn
 - **Dependency Injection**: Support for trait-based DI pattern
 - **Type Safe**: Strong error handling with thiserror
 - **Async**: Full async support using tokio
@@ -54,6 +57,9 @@ Press `Ctrl+C` on subscriber for graceful shutdown.
 - **Publisher**: Auto-create exchange + send messages
 - **Subscriber**: Auto-create exchange + queue + binding
 - **Worker Registry**: Register multiple workers with clean pattern
+- **Retry**: Automatic retry with delay for failed messages
+- **Prefetch**: AMQP QoS control for message buffering
+- **Concurrency**: Parallel worker processing
 - **Full Auto-Setup**: No manual infrastructure needed
 
 This follows AMQP best practices:
@@ -211,6 +217,103 @@ fn handle_log_event(data: Vec<u8>) -> easy_rmq::Result<()> {
 ✅ **Direct**: queue auto-formatted with `.job` suffix
 ✅ **Topic/Fanout**: full control over queue name
 
+### Advanced Worker Configuration
+
+#### Retry Mechanism
+
+Automatically retry failed messages with delay:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Direct)
+    .pool(pool)
+    .with_exchange("order.events.v1")
+    .queue("order.process")
+    .retry(3, 5000)  // max 3 retries, 5 second delay
+    .build(handler)
+```
+
+**How it works:**
+- Failed messages sent to `{queue}.retry` with TTL
+- After delay, message returns to original queue
+- After max retries exceeded, sent to `{queue}.dlq` (Dead Letter Queue)
+- Retry count tracked in message headers: `x-retry-count`
+
+#### Prefetch (QoS) Control
+
+Control how many messages pre-fetched from broker:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Direct)
+    .pool(pool)
+    .queue("order.process")
+    .prefetch(10)  // Buffer 10 messages
+    .build(handler)
+```
+
+**Prefetch behavior:**
+- Without `.concurrency()`: Messages buffered, processed sequentially 1-by-1
+- With `.concurrency()`: Buffer size for parallel workers
+
+#### Parallel Processing
+
+Run multiple workers concurrently with controlled parallelism:
+
+```rust
+WorkerBuilder::new(ExchangeKind::Direct)
+    .pool(pool)
+    .queue("order.process")
+    .prefetch(50)              // Buffer 50 messages
+    .concurrency(10)           // Spawn 10 parallel workers
+    .parallelize(tokio::task::spawn)  // Async tasks
+    .build(handler)
+```
+
+**Configuration breakdown:**
+- `.prefetch(N)` - AMQP prefetch count (buffer size from broker)
+- `.concurrency(N)` - Number of parallel worker tasks
+- `.parallelize(spawn_fn)` - Spawn function for task creation
+
+**Spawn function options:**
+
+```rust
+// Async I/O tasks (default, good for database/HTTP calls)
+.parallelize(tokio::task::spawn)
+
+// CPU-intensive or blocking operations
+.parallelize(tokio::task::spawn_blocking)
+```
+
+**Worker model:**
+- Each worker runs its own consumer loop with unique consumer tag
+- Workers compete for messages from the same queue
+- Prefetch divides evenly among workers (e.g., prefetch=50, 10 workers → 5 per worker)
+
+**Configuration Comparison:**
+
+| Scenario | `.prefetch()` | `.concurrency()` | `.parallelize()` | Behavior |
+|----------|---------------|------------------|------------------|----------|
+| Sequential | Not set / 1 | Not set | Not set | 1 message at a time |
+| Buffered | 10 | Not set | Not set | Buffer 10, process 1-by-1 |
+| Parallel Async | 50 | 10 | `tokio::task::spawn` | 10 workers, async execution |
+| Parallel Blocking | 50 | 10 | `tokio::task::spawn_blocking` | 10 workers, blocking threads |
+
+#### Complete Example with All Features
+
+```rust
+WorkerBuilder::new(ExchangeKind::Topic)
+    .pool(pool)
+    .with_exchange("logs.v1")
+    .routing_key("order.*")
+    .queue("api_logs")
+    .retry(2, 10000)              // 2 retries, 10s delay
+    .prefetch(100)                // Buffer 100 messages
+    .concurrency(20)              // 20 parallel workers
+    .parallelize(tokio::task::spawn)  // Async execution
+    .build(handle_log_event)
+```
+
+⚠️ **Important:** `.concurrency()` requires `.parallelize()` to be set
+
 ### Exchange Types Detail
 
 **Direct Exchange** - Queue name auto-formatted with `.job` suffix:
@@ -283,7 +386,7 @@ let order_service = OrderService::new(publisher);
 
 See `examples/` folder for usage examples:
 - `publisher.rs` - Publisher with various exchange types
-- `subscriber.rs` - Multi-worker with SubscriberRegistry
+- `subscriber.rs` - Multi-worker with retry, prefetch, concurrency, and parallelize
 
 Run examples:
 ```bash
