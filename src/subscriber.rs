@@ -349,10 +349,15 @@ impl Subscriber {
                 .map_err(AmqpError::ConnectionError)?;
         }
 
+        let consumer_tag = format!("{}-worker-{}-{}", queue, worker_id, std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos());
+
         let consumer = channel
             .basic_consume(
                 queue,
-                &format!("worker-{}", worker_id),
+                &consumer_tag,
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
