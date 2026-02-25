@@ -1,7 +1,17 @@
 use crate::{ChannelPool, HandlerFn, Result, Subscriber};
 use lapin::ExchangeKind;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+
+pub type SpawnFn = Arc<
+    dyn Fn(
+            Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
+        ) -> tokio::task::JoinHandle<Result<()>>
+        + Send
+        + Sync,
+>;
 
 pub struct WorkerBuilder;
 
@@ -32,6 +42,8 @@ pub struct WorkerBuilderWithKind {
     retry_enabled: bool,
     max_retries: u32,
     retry_delay: Duration,
+    concurrent: u16,
+    spawn_fn: Option<SpawnFn>,
 }
 
 impl WorkerBuilderWithKind {
@@ -53,6 +65,8 @@ impl WorkerBuilderWithKind {
             retry_enabled: false,
             max_retries: 3,
             retry_delay: Duration::from_secs(60),
+            concurrent: 1,
+            spawn_fn: None,
         }
     }
 
@@ -83,6 +97,24 @@ impl WorkerBuilderWithKind {
         self
     }
 
+    pub fn concurrency(mut self, count: u16) -> Self {
+        self.concurrent = count;
+        self
+    }
+
+    pub fn parallelize<F>(mut self, spawn_fn: F) -> Self
+    where
+        F: Fn(
+                Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
+            ) -> tokio::task::JoinHandle<Result<()>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.spawn_fn = Some(Arc::new(spawn_fn));
+        self
+    }
+
     pub fn build<F>(self, handler: F) -> BuiltWorker
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
@@ -101,6 +133,9 @@ impl WorkerBuilderWithKind {
             None
         };
 
+        let concurrent = self.concurrent;
+        let spawn_fn = self.spawn_fn;
+
         match self.exchange_kind {
             ExchangeKind::Direct => {
                 let queue = self.queue.expect("queue required for Direct");
@@ -110,6 +145,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
+                        concurrent,
+                        spawn_fn,
                     },
                 }
             }
@@ -123,6 +160,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
+                        concurrent,
+                        spawn_fn,
                     },
                 }
             }
@@ -134,6 +173,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
+                        concurrent,
+                        spawn_fn,
                     },
                 }
             }
@@ -158,17 +199,23 @@ pub enum WorkerConfig {
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
+        concurrent: u16,
+        spawn_fn: Option<SpawnFn>,
     },
     Topic {
         routing_key: String,
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
+        concurrent: u16,
+        spawn_fn: Option<SpawnFn>,
     },
     Fanout {
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
+        concurrent: u16,
+        spawn_fn: Option<SpawnFn>,
     },
 }
 
@@ -209,6 +256,8 @@ impl DirectWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
+                concurrent: 1,
+                spawn_fn: None,
             },
         }
     }
@@ -255,6 +304,8 @@ impl TopicWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
+                concurrent: 1,
+                spawn_fn: None,
             },
         }
     }
@@ -297,6 +348,8 @@ impl FanoutWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
+                concurrent: 1,
+                spawn_fn: None,
             },
         }
     }
@@ -309,19 +362,8 @@ impl BuiltWorker {
                 queue,
                 handler,
                 retry_config,
-            } => {
-                let subscriber = if let Some(rc) = retry_config {
-                    self.subscriber.with_retry(rc.max_retries, rc.delay)
-                } else {
-                    self.subscriber
-                };
-                subscriber.direct(&queue).build(handler).await
-            }
-            WorkerConfig::Topic {
-                routing_key,
-                queue,
-                handler,
-                retry_config,
+                concurrent,
+                spawn_fn,
             } => {
                 let subscriber = if let Some(rc) = retry_config {
                     self.subscriber.with_retry(rc.max_retries, rc.delay)
@@ -329,6 +371,28 @@ impl BuiltWorker {
                     self.subscriber
                 };
                 subscriber
+                    .with_prefetch(concurrent)
+                    .with_spawn_fn(spawn_fn)
+                    .direct(&queue)
+                    .build(handler)
+                    .await
+            }
+            WorkerConfig::Topic {
+                routing_key,
+                queue,
+                handler,
+                retry_config,
+                concurrent,
+                spawn_fn,
+            } => {
+                let subscriber = if let Some(rc) = retry_config {
+                    self.subscriber.with_retry(rc.max_retries, rc.delay)
+                } else {
+                    self.subscriber
+                };
+                subscriber
+                    .with_prefetch(concurrent)
+                    .with_spawn_fn(spawn_fn)
                     .topic(&routing_key, &queue)
                     .build(handler)
                     .await
@@ -337,13 +401,20 @@ impl BuiltWorker {
                 queue,
                 handler,
                 retry_config,
+                concurrent,
+                spawn_fn,
             } => {
                 let subscriber = if let Some(rc) = retry_config {
                     self.subscriber.with_retry(rc.max_retries, rc.delay)
                 } else {
                     self.subscriber
                 };
-                subscriber.fanout(&queue).build(handler).await
+                subscriber
+                    .with_prefetch(concurrent)
+                    .with_spawn_fn(spawn_fn)
+                    .fanout(&queue)
+                    .build(handler)
+                    .await
             }
         }
     }

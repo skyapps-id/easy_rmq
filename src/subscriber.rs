@@ -1,6 +1,7 @@
 use crate::{
     error::{AmqpError, Result},
     pool::ChannelPool,
+    worker::SpawnFn,
 };
 use futures::StreamExt;
 use lapin::{Consumer, ExchangeKind, options::*, types::AMQPValue, types::FieldTable};
@@ -15,6 +16,8 @@ pub struct Subscriber {
     auto_declare: bool,
     retry_max_retries: Option<u32>,
     retry_delay: Option<Duration>,
+    prefetch: Option<u16>,
+    spawn_fn: Option<SpawnFn>,
 }
 
 pub struct DirectSubscribeBuilder {
@@ -51,6 +54,8 @@ impl Subscriber {
             auto_declare: true,
             retry_max_retries: None,
             retry_delay: None,
+            prefetch: None,
+            spawn_fn: None,
         }
     }
 
@@ -67,6 +72,16 @@ impl Subscriber {
     pub fn with_retry(mut self, max_retries: u32, delay: Duration) -> Self {
         self.retry_max_retries = Some(max_retries);
         self.retry_delay = Some(delay);
+        self
+    }
+
+    pub fn with_prefetch(mut self, prefetch: u16) -> Self {
+        self.prefetch = Some(prefetch);
+        self
+    }
+
+    pub fn with_spawn_fn(mut self, spawn_fn: Option<SpawnFn>) -> Self {
+        self.spawn_fn = spawn_fn;
         self
     }
 
@@ -239,6 +254,13 @@ impl Subscriber {
 
         let channel = self.channel_pool.get_channel().await?;
 
+        if let Some(prefetch) = self.prefetch {
+            channel
+                .basic_qos(prefetch, BasicQosOptions::default())
+                .await
+                .map_err(AmqpError::ConnectionError)?;
+        }
+
         let consumer = channel
             .basic_consume(
                 queue,
@@ -259,100 +281,118 @@ impl Subscriber {
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
         let max_retries = self.retry_max_retries.unwrap_or(0);
-        Self::process_messages_static(consumer, handler, retry_queue, self.channel_pool.clone(), max_retries, main_queue).await
+        Self::process_messages_static(consumer, handler, retry_queue, self.channel_pool.clone(), max_retries, main_queue, self.spawn_fn.clone()).await
     }
 
-    async fn process_messages_static<F>(mut consumer: Consumer, handler: F, retry_queue: Option<String>, channel_pool: Arc<ChannelPool>, max_retries: u32, main_queue: &str) -> Result<()>
+    async fn process_messages_static<F>(mut consumer: Consumer, handler: F, retry_queue: Option<String>, channel_pool: Arc<ChannelPool>, max_retries: u32, main_queue: &str, spawn_fn: Option<SpawnFn>) -> Result<()>
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
+        use std::sync::Arc;
+        let handler = Arc::new(handler);
+
         while let Some(delivery_result) = consumer.next().await {
             match delivery_result {
                 Ok(delivery) => {
                     let data = delivery.data.clone();
                     let acker = delivery.acker;
+                    let headers = delivery.properties.headers().clone();
+                    let delivery_data = delivery.data.clone();
 
-                    match handler(data) {
-                        Ok(_) => {
-                            acker
-                                .ack(BasicAckOptions::default())
-                                .await
-                                .map_err(AmqpError::ConnectionError)?;
-                        }
-                        Err(e) => {
-                            tracing::error!("Handler error: {:?}", e);
+                    let retry_queue_clone = retry_queue.clone();
+                    let channel_pool_clone = channel_pool.clone();
+                    let main_queue_clone = main_queue.to_string();
+                    let handler_clone = Arc::clone(&handler);
 
-                            if let Some(ref retry_q) = retry_queue {
-                                let headers = delivery.properties.headers().clone();
-                                let retry_count = headers
-                                    .and_then(|h| h.inner().get("x-retry-count").cloned())
-                                    .and_then(|v| {
-                                        match v {
-                                            AMQPValue::LongLongInt(n) => Some(n as u32),
-                                            AMQPValue::ShortShortInt(n) => Some(n as u32),
-                                            AMQPValue::ShortInt(n) => Some(n as u32),
-                                            AMQPValue::LongInt(n) => Some(n as u32),
-                                            _ => None,
-                                        }
-                                    })
-                                    .unwrap_or(0);
-
-                                if retry_count < max_retries {
-                                    let channel = channel_pool.get_channel().await?;
-                                    let mut new_headers = FieldTable::default();
-                                    new_headers.insert("x-retry-count".into(), AMQPValue::LongLongInt((retry_count + 1) as i64));
-
-                                    let publish_props = lapin::BasicProperties::default()
-                                        .with_headers(new_headers)
-                                        .with_delivery_mode(2);
-
-                                    channel
-                                        .basic_publish(
-                                            "",
-                                            retry_q,
-                                            BasicPublishOptions::default(),
-                                            &delivery.data,
-                                            publish_props,
-                                        )
-                                        .await
-                                        .map_err(AmqpError::ConnectionError)?;
-
-                                    tracing::warn!("🔄 Message sent to retry queue (attempt {}/{})", retry_count + 1, max_retries);
-
-                                    acker
-                                        .ack(BasicAckOptions::default())
-                                        .await
-                                        .map_err(AmqpError::ConnectionError)?;
-                                } else {
-                                    let dlq_queue = format!("{}.dlq", main_queue);
-                                    let channel = channel_pool.get_channel().await?;
-
-                                    channel
-                                        .basic_publish(
-                                            "",
-                                            &dlq_queue,
-                                            BasicPublishOptions::default(),
-                                            &delivery.data,
-                                            lapin::BasicProperties::default()
-                                                .with_delivery_mode(2),
-                                        )
-                                        .await
-                                        .map_err(AmqpError::ConnectionError)?;
-
-                                    tracing::error!("❌ Max retries exceeded ({}/{}), sent to DLQ: {}", retry_count, max_retries, dlq_queue);
-
-                                    acker
-                                        .ack(BasicAckOptions::default())
-                                        .await
-                                        .map_err(AmqpError::ConnectionError)?;
-                                }
-                            } else {
+                    let process_future = async move {
+                        match handler_clone(data) {
+                            Ok(_) => {
                                 acker
-                                    .nack(BasicNackOptions::default())
+                                    .ack(BasicAckOptions::default())
                                     .await
                                     .map_err(AmqpError::ConnectionError)?;
                             }
+                            Err(e) => {
+                                tracing::error!("Handler error: {:?}", e);
+
+                                if let Some(ref retry_q) = retry_queue_clone {
+                                    let retry_count = headers
+                                        .and_then(|h| h.inner().get("x-retry-count").cloned())
+                                        .and_then(|v| {
+                                            match v {
+                                                AMQPValue::LongLongInt(n) => Some(n as u32),
+                                                AMQPValue::ShortShortInt(n) => Some(n as u32),
+                                                AMQPValue::ShortInt(n) => Some(n as u32),
+                                                AMQPValue::LongInt(n) => Some(n as u32),
+                                                _ => None,
+                                            }
+                                        })
+                                        .unwrap_or(0);
+
+                                    if retry_count < max_retries {
+                                        let channel = channel_pool_clone.get_channel().await?;
+                                        let mut new_headers = FieldTable::default();
+                                        new_headers.insert("x-retry-count".into(), AMQPValue::LongLongInt((retry_count + 1) as i64));
+
+                                        let publish_props = lapin::BasicProperties::default()
+                                            .with_headers(new_headers)
+                                            .with_delivery_mode(2);
+
+                                        channel
+                                            .basic_publish(
+                                                "",
+                                                retry_q,
+                                                BasicPublishOptions::default(),
+                                                &delivery_data,
+                                                publish_props,
+                                            )
+                                            .await
+                                            .map_err(AmqpError::ConnectionError)?;
+
+                                        tracing::warn!("🔄 Message sent to retry queue (attempt {}/{})", retry_count + 1, max_retries);
+
+                                        acker
+                                            .ack(BasicAckOptions::default())
+                                            .await
+                                            .map_err(AmqpError::ConnectionError)?;
+                                    } else {
+                                        let dlq_queue = format!("{}.dlq", main_queue_clone);
+                                        let channel = channel_pool_clone.get_channel().await?;
+
+                                        channel
+                                            .basic_publish(
+                                                "",
+                                                &dlq_queue,
+                                                BasicPublishOptions::default(),
+                                                &delivery_data,
+                                                lapin::BasicProperties::default()
+                                                    .with_delivery_mode(2),
+                                            )
+                                            .await
+                                            .map_err(AmqpError::ConnectionError)?;
+
+                                        tracing::error!("❌ Max retries exceeded ({}/{}), sent to DLQ: {}", retry_count, max_retries, dlq_queue);
+
+                                        acker
+                                            .ack(BasicAckOptions::default())
+                                            .await
+                                            .map_err(AmqpError::ConnectionError)?;
+                                    }
+                                } else {
+                                    acker
+                                        .nack(BasicNackOptions::default())
+                                        .await
+                                        .map_err(AmqpError::ConnectionError)?;
+                                }
+                            }
                         }
+                        Ok(())
+                    };
+
+                    if let Some(spawner) = spawn_fn.clone() {
+                        spawner(Box::pin(process_future));
+                    } else {
+                        process_future.await?;
                     }
                 }
                 Err(e) => {

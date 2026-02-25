@@ -27,8 +27,6 @@ fn handle_log_event(data: Vec<u8>) -> Result<()> {
 
     println!("📊 [Log] [{}] {} | {}", level, service, message);
 
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
     Ok(())
 }
 
@@ -51,6 +49,8 @@ async fn main() -> Result<()> {
                     .with_exchange("order.events.v1")
                     .queue("order.process")
                     .retry(3, 5000)
+                    .concurrency(5)
+                    .parallelize(tokio::task::spawn)
                     .build(handle_order_event)
             }
         })
@@ -63,6 +63,8 @@ async fn main() -> Result<()> {
                     .routing_key("order.*")
                     .queue("api_logs")
                     .retry(2, 10000)
+                    .concurrency(10)
+                    .parallelize(tokio::task::spawn)
                     .build(handle_log_event)
             }
         });

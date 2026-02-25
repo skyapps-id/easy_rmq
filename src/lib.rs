@@ -12,7 +12,7 @@ pub use pool::{create_pool, AmqpPool, ChannelPool, AmqpConnectionManager};
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;
 pub use registry::{SubscriberRegistry, HandlerFn};
-pub use worker::{WorkerBuilder, BuiltWorker, DirectWorkerBuilder, TopicWorkerBuilder, FanoutWorkerBuilder, RetryConfig};
+pub use worker::{WorkerBuilder, BuiltWorker, DirectWorkerBuilder, TopicWorkerBuilder, FanoutWorkerBuilder, RetryConfig, SpawnFn};
 
 use std::sync::Arc;
 
