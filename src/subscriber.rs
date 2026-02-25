@@ -17,6 +17,7 @@ pub struct Subscriber {
     retry_max_retries: Option<u32>,
     retry_delay: Option<Duration>,
     prefetch: Option<u16>,
+    concurrency: Option<u16>,
     spawn_fn: Option<SpawnFn>,
 }
 
@@ -55,6 +56,7 @@ impl Subscriber {
             retry_max_retries: None,
             retry_delay: None,
             prefetch: None,
+            concurrency: None,
             spawn_fn: None,
         }
     }
@@ -77,6 +79,11 @@ impl Subscriber {
 
     pub fn with_prefetch(mut self, prefetch: u16) -> Self {
         self.prefetch = Some(prefetch);
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: Option<u16>) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
@@ -252,6 +259,21 @@ impl Subscriber {
 
         let retry_queue = self.setup_retry_infrastructure(queue).await?;
 
+        if let Some(num_workers) = self.concurrency {
+            if let Some(spawner) = &self.spawn_fn {
+                self.consume_parallel_workers(queue, handler, retry_queue, num_workers, spawner).await
+            } else {
+                return Err(AmqpError::ChannelError("concurrency requires parallelize() to be set".to_string()));
+            }
+        } else {
+            self.consume_single(queue, handler, retry_queue).await
+        }
+    }
+
+    async fn consume_single<F>(&self, queue: &str, handler: F, retry_queue: Option<String>) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
         let channel = self.channel_pool.get_channel().await?;
 
         if let Some(prefetch) = self.prefetch {
@@ -273,6 +295,73 @@ impl Subscriber {
 
         self.process_messages(consumer, handler, retry_queue, queue).await
     }
+
+    async fn consume_parallel_workers<F>(&self, queue: &str, handler: F, retry_queue: Option<String>, num_workers: u16, spawner: &SpawnFn) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        let mut handles = Vec::new();
+        let handler = Arc::new(handler);
+
+        for i in 0..num_workers {
+            let subscriber = self.clone();
+            let queue = queue.to_string();
+            let handler = Arc::clone(&handler);
+            let retry_queue = retry_queue.clone();
+            let spawner = spawner.clone();
+
+            let future = async move {
+                tracing::info!("Worker {} starting", i);
+                let result = Self::worker_loop(subscriber, &queue, handler, retry_queue, i).await;
+                if let Err(e) = &result {
+                    tracing::error!("Worker {} failed: {:?}", i, e);
+                }
+                result
+            };
+
+            handles.push(spawner(Box::pin(future)));
+        }
+
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    tracing::error!("Task join error: {:?}", e);
+                    return Err(AmqpError::ChannelError(format!("Task join error: {}", e)));
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn worker_loop<F>(subscriber: Subscriber, queue: &str, handler: Arc<F>, retry_queue: Option<String>, worker_id: u16) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
+    {
+        let channel = subscriber.channel_pool.get_channel().await?;
+
+        if let Some(prefetch) = subscriber.prefetch {
+            channel
+                .basic_qos(prefetch, BasicQosOptions::default())
+                .await
+                .map_err(AmqpError::ConnectionError)?;
+        }
+
+        let consumer = channel
+            .basic_consume(
+                queue,
+                &format!("worker-{}", worker_id),
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(AmqpError::ConnectionError)?;
+
+        let max_retries = subscriber.retry_max_retries.unwrap_or(0);
+        Self::process_messages_static(consumer, handler, retry_queue, subscriber.channel_pool.clone(), max_retries, queue, subscriber.spawn_fn.clone()).await
+    }
 }
 
 impl Subscriber {
@@ -281,16 +370,14 @@ impl Subscriber {
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
         let max_retries = self.retry_max_retries.unwrap_or(0);
+        let handler = Arc::new(handler);
         Self::process_messages_static(consumer, handler, retry_queue, self.channel_pool.clone(), max_retries, main_queue, self.spawn_fn.clone()).await
     }
 
-    async fn process_messages_static<F>(mut consumer: Consumer, handler: F, retry_queue: Option<String>, channel_pool: Arc<ChannelPool>, max_retries: u32, main_queue: &str, spawn_fn: Option<SpawnFn>) -> Result<()>
+    async fn process_messages_static<F>(mut consumer: Consumer, handler: Arc<F>, retry_queue: Option<String>, channel_pool: Arc<ChannelPool>, max_retries: u32, main_queue: &str, spawn_fn: Option<SpawnFn>) -> Result<()>
     where
         F: Fn(Vec<u8>) -> Result<()> + Send + Sync + 'static,
     {
-        use std::sync::Arc;
-        let handler = Arc::new(handler);
-
         while let Some(delivery_result) = consumer.next().await {
             match delivery_result {
                 Ok(delivery) => {

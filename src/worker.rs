@@ -42,7 +42,8 @@ pub struct WorkerBuilderWithKind {
     retry_enabled: bool,
     max_retries: u32,
     retry_delay: Duration,
-    concurrent: u16,
+    prefetch: u16,
+    concurrency: Option<u16>,
     spawn_fn: Option<SpawnFn>,
 }
 
@@ -65,7 +66,8 @@ impl WorkerBuilderWithKind {
             retry_enabled: false,
             max_retries: 3,
             retry_delay: Duration::from_secs(60),
-            concurrent: 1,
+            prefetch: 1,
+            concurrency: None,
             spawn_fn: None,
         }
     }
@@ -97,8 +99,13 @@ impl WorkerBuilderWithKind {
         self
     }
 
+    pub fn prefetch(mut self, count: u16) -> Self {
+        self.prefetch = count;
+        self
+    }
+
     pub fn concurrency(mut self, count: u16) -> Self {
-        self.concurrent = count;
+        self.concurrency = Some(count);
         self
     }
 
@@ -106,10 +113,7 @@ impl WorkerBuilderWithKind {
     where
         F: Fn(
                 Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
-            ) -> tokio::task::JoinHandle<Result<()>>
-            + Send
-            + Sync
-            + 'static,
+            ) -> tokio::task::JoinHandle<Result<()>> + Send + Sync + 'static,
     {
         self.spawn_fn = Some(Arc::new(spawn_fn));
         self
@@ -133,7 +137,8 @@ impl WorkerBuilderWithKind {
             None
         };
 
-        let concurrent = self.concurrent;
+        let prefetch = self.prefetch;
+        let concurrency = self.concurrency;
         let spawn_fn = self.spawn_fn;
 
         match self.exchange_kind {
@@ -145,7 +150,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
-                        concurrent,
+                        prefetch,
+                        concurrency,
                         spawn_fn,
                     },
                 }
@@ -160,7 +166,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
-                        concurrent,
+                        prefetch,
+                        concurrency,
                         spawn_fn,
                     },
                 }
@@ -173,7 +180,8 @@ impl WorkerBuilderWithKind {
                         queue,
                         handler: Box::new(handler),
                         retry_config,
-                        concurrent,
+                        prefetch,
+                        concurrency,
                         spawn_fn,
                     },
                 }
@@ -199,7 +207,8 @@ pub enum WorkerConfig {
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
-        concurrent: u16,
+        prefetch: u16,
+        concurrency: Option<u16>,
         spawn_fn: Option<SpawnFn>,
     },
     Topic {
@@ -207,14 +216,16 @@ pub enum WorkerConfig {
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
-        concurrent: u16,
+        prefetch: u16,
+        concurrency: Option<u16>,
         spawn_fn: Option<SpawnFn>,
     },
     Fanout {
         queue: String,
         handler: HandlerFn,
         retry_config: Option<RetryConfig>,
-        concurrent: u16,
+        prefetch: u16,
+        concurrency: Option<u16>,
         spawn_fn: Option<SpawnFn>,
     },
 }
@@ -256,7 +267,8 @@ impl DirectWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
-                concurrent: 1,
+                prefetch: 1,
+                concurrency: None,
                 spawn_fn: None,
             },
         }
@@ -304,7 +316,8 @@ impl TopicWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
-                concurrent: 1,
+                prefetch: 1,
+                concurrency: None,
                 spawn_fn: None,
             },
         }
@@ -348,7 +361,8 @@ impl FanoutWorkerBuilder {
                 queue: self.queue,
                 handler: Box::new(handler),
                 retry_config: None,
-                concurrent: 1,
+                prefetch: 1,
+                concurrency: None,
                 spawn_fn: None,
             },
         }
@@ -362,7 +376,8 @@ impl BuiltWorker {
                 queue,
                 handler,
                 retry_config,
-                concurrent,
+                prefetch,
+                concurrency,
                 spawn_fn,
             } => {
                 let subscriber = if let Some(rc) = retry_config {
@@ -371,7 +386,8 @@ impl BuiltWorker {
                     self.subscriber
                 };
                 subscriber
-                    .with_prefetch(concurrent)
+                    .with_prefetch(prefetch)
+                    .with_concurrency(concurrency)
                     .with_spawn_fn(spawn_fn)
                     .direct(&queue)
                     .build(handler)
@@ -382,7 +398,8 @@ impl BuiltWorker {
                 queue,
                 handler,
                 retry_config,
-                concurrent,
+                prefetch,
+                concurrency,
                 spawn_fn,
             } => {
                 let subscriber = if let Some(rc) = retry_config {
@@ -391,7 +408,8 @@ impl BuiltWorker {
                     self.subscriber
                 };
                 subscriber
-                    .with_prefetch(concurrent)
+                    .with_prefetch(prefetch)
+                    .with_concurrency(concurrency)
                     .with_spawn_fn(spawn_fn)
                     .topic(&routing_key, &queue)
                     .build(handler)
@@ -401,7 +419,8 @@ impl BuiltWorker {
                 queue,
                 handler,
                 retry_config,
-                concurrent,
+                prefetch,
+                concurrency,
                 spawn_fn,
             } => {
                 let subscriber = if let Some(rc) = retry_config {
@@ -410,7 +429,8 @@ impl BuiltWorker {
                     self.subscriber
                 };
                 subscriber
-                    .with_prefetch(concurrent)
+                    .with_prefetch(prefetch)
+                    .with_concurrency(concurrency)
                     .with_spawn_fn(spawn_fn)
                     .fanout(&queue)
                     .build(handler)
