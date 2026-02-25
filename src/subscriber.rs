@@ -199,8 +199,10 @@ impl Subscriber {
 
             let delay_ms = delay.as_millis() as u32;
 
+            self.ensure_binding(main_queue, &self.exchange, main_queue).await?;
+
             let mut retry_args = FieldTable::default();
-            retry_args.insert("x-dead-letter-exchange".into(), AMQPValue::LongString("".into()));
+            retry_args.insert("x-dead-letter-exchange".into(), AMQPValue::LongString(self.exchange.clone().into()));
             retry_args.insert("x-dead-letter-routing-key".into(), AMQPValue::LongString(main_queue.into()));
             retry_args.insert("x-message-ttl".into(), AMQPValue::LongLongInt(delay_ms as i64));
 
